@@ -548,7 +548,8 @@
 }
 
 @media (max-width: 1180px) {
-  .shell {
+  .shell,
+  .shell.search-open {
     grid-template-columns: 72px 240px minmax(0, 1fr);
   }
   .shell.sidebar-collapsed,
@@ -662,8 +663,13 @@
 }
 
 @media (max-width: 520px) {
+  .topbar {
+    flex-wrap: wrap;
+  }
   .search {
-    display: none;
+    order: 1;
+    width: 100%;
+    flex: 1 0 100%;
   }
   .topbar-meta,
   .topbar-divider {

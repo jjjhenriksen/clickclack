@@ -51,6 +51,7 @@
   const LAST_CHANNEL_STORAGE_PREFIX = "clickclack:last-channel:v1:";
   const BROWSER_NOTIFICATIONS_STORAGE_PREFIX = "clickclack:browser-notifications-enabled:v1:";
   const MOBILE_NAV_MEDIA_QUERY = "(max-width: 820px)";
+  const FULL_WIDTH_SEARCH_MEDIA_QUERY = "(max-width: 420px)";
   const SHOW_AGENT_ACTIVITY_STORAGE_KEY = "clickclack:show-agent-activity:v1";
   const HIDE_COMMENTARY_STORAGE_KEY = "clickclack:hide-commentary:v1";
   const HIDE_TOOL_CALLS_STORAGE_KEY = "clickclack:hide-tool-calls:v1";
@@ -88,19 +89,22 @@
   let artifactTrigger: HTMLElement | null = null;
   let artifactThreadScrollTop: number | null = null;
   let artifactViewerElement: HTMLElement | null = null;
+  let searchResultsElement: HTMLElement | null = null;
   let shellElement: HTMLElement | null = null;
-  let artifactModalInertElements = new Set<HTMLElement>();
+  let modalInertElements = new Set<HTMLElement>();
   let messageBody = "";
   let replyBody = "";
   let workspaceName = "";
   let channelName = "";
   let directMemberID = "";
   let searchQuery = "";
+  let submittedSearchQuery = "";
   let searchResults: SearchResult[] = [];
   let searchPanelOpen = false;
   let searchState: "idle" | "loading" | "ready" | "error" = "idle";
   let searchError = "";
   let searchRequestID = 0;
+  let searchResultOpening = false;
   let pendingUpload: Upload | null = null;
   let showGifPicker = false;
   let settingsModalOpen = false;
@@ -149,6 +153,7 @@
   let sidebarCollapsed = false;
   let mobileNavOpen = false;
   let mobileNavViewport = false;
+  let searchModalViewport = false;
   let replyTarget: Message | null = null;
   let replyContext: "channel" | "dm" | "thread" | null = null;
   let messageInput: HTMLTextAreaElement | null = null;
@@ -253,9 +258,12 @@
     artifactConversationKey = "";
     artifactTrigger = null;
   }
-  $: syncArtifactModalInert(
-    mobileNavViewport && selectedArtifact !== null,
-    artifactViewerElement,
+  $: syncShellModalInert(
+    mobileNavViewport && selectedArtifact !== null
+      ? artifactViewerElement
+      : searchPanelOpen && searchModalViewport
+        ? searchResultsElement
+        : null,
   );
   $: recentPeople = collectRecentPeople(messages, directConversations, user?.id || "");
   $: mentionPeople = collectMentionPeople(user, recentPeople, moderationMembers, selectedDirect);
@@ -281,18 +289,25 @@
     syncBrowserNotificationState();
     void boot();
     const mobileNavMedia = window.matchMedia(MOBILE_NAV_MEDIA_QUERY);
+    const searchModalMedia = window.matchMedia(FULL_WIDTH_SEARCH_MEDIA_QUERY);
     const handleMobileNavBreakpoint = () => {
       mobileNavOpen = false;
       mobileNavViewport = mobileNavMedia.matches;
     };
+    const handleSearchModalBreakpoint = () => {
+      searchModalViewport = searchModalMedia.matches;
+    };
     handleMobileNavBreakpoint();
+    handleSearchModalBreakpoint();
     const stopDesktopNavigate = desktop?.onNavigate((route) => {
       void goto(route, { keepFocus: true, noScroll: true });
     });
     const stopDesktopQuickCompose = desktop?.onQuickCompose(() => focusActiveComposer());
     mobileNavMedia.addEventListener("change", handleMobileNavBreakpoint);
+    searchModalMedia.addEventListener("change", handleSearchModalBreakpoint);
     return () => {
       mobileNavMedia.removeEventListener("change", handleMobileNavBreakpoint);
+      searchModalMedia.removeEventListener("change", handleSearchModalBreakpoint);
       stopDesktopNavigate?.();
       stopDesktopQuickCompose?.();
     };
@@ -392,7 +407,7 @@
     if (agentProgressSweeper) window.clearInterval(agentProgressSweeper);
     if (activityClockSweeper) window.clearInterval(activityClockSweeper);
     if (hiddenDirectUndoTimer) clearTimeout(hiddenDirectUndoTimer);
-    syncArtifactModalInert(false, null);
+    syncShellModalInert(null);
   });
 
   async function boot() {
@@ -2180,6 +2195,7 @@
     }
     const query = searchQuery.trim();
     const requestID = ++searchRequestID;
+    submittedSearchQuery = query;
     searchPanelOpen = true;
     searchState = "loading";
     searchError = "";
@@ -2204,6 +2220,7 @@
   function resetSearch() {
     searchRequestID += 1;
     searchQuery = "";
+    submittedSearchQuery = "";
     searchResults = [];
     searchPanelOpen = false;
     searchState = "idle";
@@ -2212,25 +2229,32 @@
 
   async function openSearchResult(result: SearchResult) {
     const targetID = result.channel_id || result.direct_conversation_id || "";
-    if (!selectedWorkspaceID || !targetID) return;
-    if (currentConversationKey() !== targetID) {
-      await navigateToApp(selectedWorkspaceID, targetID);
-      await applyRoute(selectedWorkspaceID, targetID);
-    }
-    if (currentConversationKey() !== targetID) return;
-    if (result.parent_message_id) {
-      await refreshThread(result.thread_root_id);
-      if (selectedThread?.route_id) {
-        await navigateToApp(selectedWorkspaceID, selectedThread.id);
+    if (!selectedWorkspaceID || !targetID || searchResultOpening) return;
+    searchResultOpening = true;
+    try {
+      if (window.matchMedia(FULL_WIDTH_SEARCH_MEDIA_QUERY).matches) resetSearch();
+      if (currentConversationKey() !== targetID) {
+        await navigateToApp(selectedWorkspaceID, targetID);
+        await applyRoute(selectedWorkspaceID, targetID);
       }
-      await highlightMessage(result.id);
-      return;
+      if (currentConversationKey() !== targetID) return;
+      if (result.parent_message_id) {
+        resetSearch();
+        await refreshThread(result.thread_root_id);
+        if (selectedThread?.route_id) {
+          await navigateToApp(selectedWorkspaceID, selectedThread.id);
+        }
+        await highlightMessage(result.id);
+        return;
+      }
+      if (result.channel_seq && result.channel_seq > 0) {
+        await loadMessagesAroundSeq(result.channel_seq, result.id);
+        return;
+      }
+      await loadMessages();
+    } finally {
+      searchResultOpening = false;
     }
-    if (result.channel_seq && result.channel_seq > 0) {
-      await loadMessagesAroundSeq(result.channel_seq, result.id);
-      return;
-    }
-    await loadMessages();
   }
 
   async function loadMessagesAround(target: Message) {
@@ -2911,14 +2935,14 @@
     });
   }
 
-  function syncArtifactModalInert(active: boolean, viewer: HTMLElement | null) {
-    for (const element of artifactModalInertElements) element.inert = false;
-    artifactModalInertElements.clear();
-    if (!active || !shellElement || !viewer) return;
+  function syncShellModalInert(viewer: HTMLElement | null) {
+    for (const element of modalInertElements) element.inert = false;
+    modalInertElements.clear();
+    if (!shellElement || !viewer) return;
     for (const child of shellElement.children) {
       if (!(child instanceof HTMLElement) || child === viewer || child.inert) continue;
       child.inert = true;
-      artifactModalInertElements.add(child);
+      modalInertElements.add(child);
     }
   }
 
@@ -3337,7 +3361,7 @@
 
   {#if searchPanelOpen}
     <SearchResults
-      query={searchQuery.trim()}
+      query={submittedSearchQuery}
       results={searchResults}
       state={searchState}
       error={searchError}
@@ -3345,6 +3369,7 @@
       inert={mobileNavOpen || selectedArtifact !== null}
       onClose={resetSearch}
       onOpenResult={(result) => void openSearchResult(result)}
+      onPanelRef={(element) => (searchResultsElement = element)}
     />
   {/if}
 

@@ -2116,6 +2116,8 @@ test("automatic read receipts do not clear unseen paged history", async ({ page 
   await expect.poll(async () => (await currentChannelState()).last_read_seq || 0).toBe(0);
 
   await page.keyboard.press("Escape");
+  await expect(page.getByLabel("Search results")).toHaveCount(0);
+  await page.keyboard.press("Escape");
   await expect(page.locator(".markdown").filter({ hasText: "auto-read-msg-179" })).toBeVisible();
   await expectScrollAtMessageEnd(page);
   await expect.poll(async () => (await currentChannelState()).last_read_seq || 0).toBe(180);
@@ -2135,6 +2137,12 @@ test("renders search results in a responsive sidebar", async ({ page }) => {
     data: { body },
   });
   expect(messageResponse.ok()).toBe(true);
+  const { message } = (await messageResponse.json()) as { message: { id: string } };
+  const threadReply = "A thread reply containing threadneedle for pane handoff proof.";
+  const replyResponse = await page.request.post(`/api/messages/${message.id}/thread/replies`, {
+    data: { body: threadReply },
+  });
+  expect(replyResponse.ok()).toBe(true);
 
   await page.goto("/app");
   await waitForAppReady(page);
@@ -2161,6 +2169,16 @@ test("renders search results in a responsive sidebar", async ({ page }) => {
   const result = results.locator(".search-result", { hasText: "precisionneedle" });
   await expect(result).toContainText(body);
   await expect(result.locator("mark")).toHaveText("precisionneedle");
+  const closeButton = results.getByRole("button", { name: "Close search panel" });
+  await closeButton.focus();
+  await page.keyboard.press("Tab");
+  await expect(result).toBeFocused();
+  expect(await result.evaluate((element) => getComputedStyle(element).outlineStyle)).toBe("solid");
+  await page.keyboard.press("Shift+Tab");
+  await expect(closeButton).toBeFocused();
+  expect(await closeButton.evaluate((element) => getComputedStyle(element).outlineStyle)).toBe(
+    "solid",
+  );
 
   await expect
     .poll(async () => (await results.boundingBox())?.width || 0)
@@ -2176,6 +2194,10 @@ test("renders search results in a responsive sidebar", async ({ page }) => {
     await page.screenshot({ path: "docs/proof/search-sidebar.png", fullPage: true });
   }
 
+  await page.getByLabel("Search messages").fill("unsubmitted query");
+  await expect(results.getByText("Results for “precisionneedle”")).toBeVisible();
+  await expect(result).toBeVisible();
+
   await result.click();
   await expect(results).toBeVisible();
   await expect(page.locator(".message-row.highlight")).toContainText("precisionneedle");
@@ -2185,6 +2207,36 @@ test("renders search results in a responsive sidebar", async ({ page }) => {
   await expect
     .poll(async () => (await page.locator(".timeline").boundingBox())?.width || 0)
     .toBeGreaterThan(timelineBox!.width);
+
+  await page.getByLabel("Search messages").fill("threadneedle");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  const threadResult = results.locator(".search-result", { hasText: "threadneedle" });
+  await expect(threadResult).toBeVisible();
+  await threadResult.click();
+  await expect(results).toHaveCount(0);
+  await expect(page.getByLabel("Thread pane")).toBeVisible();
+  await expect(page.locator(".reply .markdown").filter({ hasText: threadReply })).toBeVisible();
+  await page.getByLabel("Search messages").fill("precisionneedle");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(results).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(results).toHaveCount(0);
+  await expect(page.getByLabel("Thread pane")).toBeVisible();
+  await expect(page.locator(".reply .markdown").filter({ hasText: threadReply })).toBeVisible();
+  await page.getByLabel("Thread pane").getByRole("button", { name: "Close thread" }).click();
+
+  await page.setViewportSize({ width: 1024, height: 720 });
+  await page.getByLabel("Search messages").fill("precisionneedle");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(results).toBeVisible();
+  await expect
+    .poll(() =>
+      page
+        .locator(".shell")
+        .evaluate((element) => getComputedStyle(element).gridTemplateColumns.split(" ").length),
+    )
+    .toBe(3);
+  await results.getByRole("button", { name: "Close search panel" }).click();
 
   await page.setViewportSize({ width: 768, height: 720 });
   await page.getByLabel("Search messages").fill("precisionneedle");
@@ -2198,8 +2250,40 @@ test("renders search results in a responsive sidebar", async ({ page }) => {
   const mobileResultsBox = await results.boundingBox();
   expect(mobileResultsBox!.x + mobileResultsBox!.width).toBe(768);
   expect(mobileResultsBox!.height).toBe(720);
+  await page.setViewportSize({ width: 420, height: 720 });
+  await expect(results).toHaveAttribute("role", "dialog");
+  await expect(results).toHaveAttribute("aria-modal", "true");
+  await expect(results.getByRole("button", { name: "Close search panel" })).toBeFocused();
+  await expect(page.locator(".timeline")).toHaveAttribute("inert", "");
+  await expect(page.getByRole("button", { name: "Toggle navigation" })).toHaveAttribute(
+    "inert",
+    "",
+  );
+  await page.setViewportSize({ width: 768, height: 720 });
+  await expect(results).toHaveAttribute("role", "complementary");
+  await expect(results).not.toHaveAttribute("aria-modal", "true");
+  await expect(page.locator(".timeline")).not.toHaveAttribute("inert", "");
+  await expect(page.getByRole("button", { name: "Toggle navigation" })).not.toHaveAttribute(
+    "inert",
+    "",
+  );
   await page.keyboard.press("Escape");
   await expect(results).toHaveCount(0);
+
+  await page.setViewportSize({ width: 420, height: 720 });
+  await page.getByLabel("Search messages").fill("precisionneedle");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  const fullWidthResult = results.locator(".search-result", { hasText: "precisionneedle" });
+  await expect(fullWidthResult).toBeVisible();
+  const fullWidthCloseButton = results.getByRole("button", { name: "Close search panel" });
+  await expect(fullWidthCloseButton).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  await expect(fullWidthResult).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(fullWidthCloseButton).toBeFocused();
+  await fullWidthResult.click();
+  await expect(results).toHaveCount(0);
+  await expect(page.locator(".message-row.highlight")).toContainText("precisionneedle");
 });
 test("message history pages older, newer, and search target windows", async ({ page }) => {
   const workspacesResponse = await page.request.get("/api/workspaces");
@@ -2301,7 +2385,9 @@ test("message history pages older, newer, and search target windows", async ({ p
 
   await page.getByLabel("Search messages").fill("targetten");
   await page.getByRole("button", { name: "Search", exact: true }).click();
-  await expect(page.getByLabel("Search results").getByText("targetten")).toBeVisible();
+  await expect(
+    page.getByLabel("Search results").locator(".search-result", { hasText: "targetten" }),
+  ).toBeVisible();
   const aroundPage = page.waitForResponse(
     (response) =>
       response.url().includes(`/api/channels/${channel.channel.id}/messages`) &&

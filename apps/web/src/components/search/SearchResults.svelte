@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import Avatar from "../avatar/Avatar.svelte";
   import { handleLabel, isDeletedBot, userHandle } from "../../lib/chat/people";
   import { time } from "../../lib/format";
@@ -13,9 +14,64 @@
     inert?: boolean;
     onClose: () => void;
     onOpenResult: (result: SearchResult) => void;
+    onPanelRef?: (element: HTMLElement | null) => void;
   };
 
-  let { query, results, state, error, covered = false, inert = false, onClose, onOpenResult }: Props = $props();
+  let {
+    query,
+    results,
+    state: searchState,
+    error,
+    covered = false,
+    inert = false,
+    onClose,
+    onOpenResult,
+    onPanelRef,
+  }: Props = $props();
+  let panelElement = $state<HTMLElement>();
+  let closeButton = $state<HTMLButtonElement>();
+  let fullWidth = $state(false);
+
+  onMount(() => {
+    onPanelRef?.(panelElement ?? null);
+    const media = window.matchMedia("(max-width: 420px)");
+    let restoreFocus: HTMLElement | null = null;
+    const syncFullWidth = () => {
+      const nextFullWidth = media.matches;
+      if (nextFullWidth === fullWidth) return;
+      fullWidth = nextFullWidth;
+      if (nextFullWidth) {
+        restoreFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        closeButton?.focus();
+      } else {
+        restoreFocus?.focus();
+        restoreFocus = null;
+      }
+    };
+    syncFullWidth();
+    media.addEventListener("change", syncFullWidth);
+    return () => {
+      media.removeEventListener("change", syncFullWidth);
+      if (fullWidth) restoreFocus?.focus();
+      onPanelRef?.(null);
+    };
+  });
+
+  function handlePanelKeydown(event: KeyboardEvent) {
+    if (!fullWidth || event.key !== "Tab") return;
+    if (!panelElement) return;
+    const focusable = Array.from(panelElement.querySelectorAll<HTMLElement>("button:not(:disabled)"));
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
 
   function snippetParts(snippet: string, highlights: SearchHighlight[]) {
     const characters = Array.from(snippet);
@@ -34,36 +90,40 @@
 </script>
 
 <aside
+  bind:this={panelElement}
   class="search-results"
   class:covered
   {inert}
   aria-hidden={covered ? "true" : undefined}
   aria-label="Search results"
+  role={fullWidth ? "dialog" : "complementary"}
+  aria-modal={fullWidth ? "true" : undefined}
+  onkeydown={handlePanelKeydown}
 >
   <header class="search-results-head">
     <div>
       <p>Search</p>
       <strong>Results for “{query}”</strong>
     </div>
-    <button type="button" aria-label="Close search panel" onclick={onClose}>&times;</button>
+    <button bind:this={closeButton} type="button" aria-label="Close search panel" onclick={onClose}>&times;</button>
   </header>
 
   <div class="search-results-summary" aria-live="polite">
-    {#if state === "loading"}
+    {#if searchState === "loading"}
       Searching messages…
-    {:else if state === "ready"}
+    {:else if searchState === "ready"}
       {results.length} {results.length === 1 ? "result" : "results"}
-    {:else if state === "error"}
+    {:else if searchState === "error"}
       Search unavailable
     {/if}
   </div>
 
   <div class="search-results-scroll">
-    {#if state === "loading"}
+    {#if searchState === "loading"}
       <div class="search-state search-state-loading" role="status">
         <span></span><span></span><span></span>
       </div>
-    {:else if state === "error"}
+    {:else if searchState === "error"}
       <div class="search-state">
         <span class="search-state-icon" aria-hidden="true">!</span>
         <strong>We couldn’t search messages</strong>
