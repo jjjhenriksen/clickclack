@@ -1250,6 +1250,48 @@
   cursor: zoom-in;
 }
 
+/* Markdown tables — scrollable wrapper preserves layout via anonymous table box */
+.markdown table {
+  display: block;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  max-width: 100%;
+  width: 100%;
+  border-collapse: collapse;
+  border-spacing: 0;
+  margin-top: 6px;
+  font-size: 0.9em;
+}
+
+.markdown table:first-child {
+  margin-top: 0;
+}
+
+.markdown thead {
+  background: var(--muted-2);
+}
+
+.markdown th,
+.markdown td {
+  padding: 8px 12px;
+  text-align: left;
+  vertical-align: top;
+  border: 1px solid var(--line);
+}
+
+.markdown thead th {
+  font-weight: 700;
+  color: var(--text-strong);
+}
+
+.markdown tbody tr:nth-child(even) {
+  background: color-mix(in srgb, var(--muted-2) 18%, transparent);
+}
+
+.markdown tbody tr:hover {
+  background: color-mix(in srgb, var(--muted-2) 26%, transparent);
+}
+
 .gif-player {
   position: relative;
   display: inline-block;
