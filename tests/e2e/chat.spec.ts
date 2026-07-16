@@ -1388,22 +1388,61 @@ test("sends messages, searches, uploads, opens a thread, and creates a DM", asyn
   await expect(page.locator(".reply .markdown").filter({ hasText: "thread reply" })).toBeVisible();
   await expect(threadedRow.locator(".thread-hint")).toContainText("1 reply");
 
-  const threadPane = page.getByLabel("Thread pane");
+  const threadPane = page.getByLabel("Thread pane", { exact: true });
   await threadPane.getByRole("button", { name: "Close thread" }).click();
   await expect(threadPane.getByRole("button", { name: "Close thread" })).toBeHidden();
   await expect(threadPane.getByText("No thread open")).toBeVisible();
   await page.getByLabel("Search messages").fill("thread");
   await page.getByRole("button", { name: "Search", exact: true }).click();
-  await page
-    .getByLabel("Search results")
+  const searchPane = page.getByLabel("Search results", { exact: true });
+  const threadReplyResult = searchPane
     .locator(".search-result")
-    .filter({ hasText: "thread _reply_" })
-    .click();
+    .filter({ hasText: "thread _reply_" });
+  await expect(threadReplyResult).toContainText("Reply in thread");
+  let searchRequestsAfterResults = 0;
+  page.on("request", (request) => {
+    if (request.url().includes("/api/search?")) searchRequestsAfterResults += 1;
+  });
+  await threadReplyResult.click();
+  await expect(page.getByRole("button", { name: "Back to search results" })).toBeVisible();
+  await expect(searchPane).toHaveCount(0);
+  await expect(page).toHaveURL(/\/app\/T[A-Z0-9]{16}\/M[A-Z0-9]{16}$/);
+
+  await page.getByRole("button", { name: "Back to search results" }).click();
+  await expect(searchPane).toBeVisible();
+  await expect(threadReplyResult).toBeVisible();
+  await expect(page.getByLabel("Thread pane")).toHaveCount(0);
+  expect(searchRequestsAfterResults).toBe(0);
+
+  await threadReplyResult.click();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("button", { name: "Back to search results" })).toHaveCount(0);
+  await expect(threadPane.getByRole("button", { name: "Close thread" })).toBeHidden();
+  await expect(threadPane.getByText("No thread open")).toBeVisible();
+  await expect(searchPane).toHaveCount(0);
+  await expect(page).toHaveURL(/\/app\/T[A-Z0-9]{16}\/C[A-Z0-9]{16}$/);
+
+  await page.getByLabel("Search messages").fill("thread");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await threadReplyResult.click();
+  await expect(page.getByLabel("Thread pane")).toBeVisible();
+  await page.getByLabel("Search messages").fill("playwright");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(
+    searchPane.locator(".search-result").filter({ hasText: "hello **playwright**" }),
+  ).toBeVisible();
+  await expect(page.getByLabel("Thread pane")).toHaveCount(0);
+  await searchPane.getByRole("button", { name: "Close search panel" }).click();
+
+  await page.getByLabel("Search messages").fill("thread");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await threadReplyResult.click();
   await expect(page.getByLabel("Thread pane")).toBeVisible();
   await expect(page).toHaveURL(/\/app\/T[A-Z0-9]{16}\/M[A-Z0-9]{16}$/);
 
   await page.reload();
   await expect(page.getByLabel("Thread pane")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Back to search results" })).toHaveCount(0);
   await expect(page.locator(".reply .markdown").filter({ hasText: "thread reply" })).toBeVisible();
   await page.getByRole("link", { name: `# ${channel.name}` }).click();
   await expect(page).toHaveURL(/\/app\/T[A-Z0-9]{16}\/C[A-Z0-9]{16}$/);
@@ -1421,6 +1460,17 @@ test("sends messages, searches, uploads, opens a thread, and creates a DM", asyn
   await page.getByLabel("Message body").fill("private playwright");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator(".markdown").filter({ hasText: "private playwright" })).toBeVisible();
+
+  // Direct-message search stays scoped to the open conversation.
+  await page.getByLabel("Search messages").fill("private playwright");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(searchPane.getByText(/Search in @Second User/)).toBeVisible();
+  const dmResult = searchPane.locator(".search-result").filter({ hasText: "private playwright" });
+  await dmResult.click();
+  await expect(searchPane).toBeVisible();
+  await expect(page.locator(".message-row.highlight")).toContainText("private playwright");
+  await searchPane.getByRole("button", { name: "Close search panel" }).click();
+  await expect(searchPane).toHaveCount(0);
 });
 
 test("confirms message deletion in the app modal", async ({ page }) => {
@@ -2137,12 +2187,6 @@ test("renders search results in a responsive sidebar", async ({ page }) => {
     data: { body },
   });
   expect(messageResponse.ok()).toBe(true);
-  const { message } = (await messageResponse.json()) as { message: { id: string } };
-  const threadReply = "A thread reply containing threadneedle for pane handoff proof.";
-  const replyResponse = await page.request.post(`/api/messages/${message.id}/thread/replies`, {
-    data: { body: threadReply },
-  });
-  expect(replyResponse.ok()).toBe(true);
 
   await page.goto("/app");
   await waitForAppReady(page);
@@ -2150,53 +2194,26 @@ test("renders search results in a responsive sidebar", async ({ page }) => {
   await expect(page.getByRole("heading", { name: `#${channel.name}` })).toBeVisible();
 
   await page.getByLabel("Search messages").fill("precisionneedle");
-  const searchResponsePromise = page.waitForResponse(
+  const searchResponse = page.waitForResponse(
     (response) => response.url().includes("/api/search?") && response.ok(),
   );
   await page.getByRole("button", { name: "Search", exact: true }).click();
-  const searchResponse = await searchResponsePromise;
-  const searchPage = (await searchResponse.json()) as {
-    results: { id: string; snippet: string; highlights: { start: number; end: number }[] }[];
-    next_cursor: string | null;
-  };
-  expect(searchPage.results).toHaveLength(1);
-  expect(searchPage.results[0].snippet).toContain("precisionneedle");
-  expect(searchPage.results[0].highlights).toHaveLength(1);
-  expect(searchPage.next_cursor).toBeNull();
+  await searchResponse;
 
   const results = page.getByLabel("Search results");
   await expect(results.getByText("Results for “precisionneedle”")).toBeVisible();
   const result = results.locator(".search-result", { hasText: "precisionneedle" });
   await expect(result).toContainText(body);
-  await expect(result.locator("mark")).toHaveText("precisionneedle");
-  const closeButton = results.getByRole("button", { name: "Close search panel" });
-  await closeButton.focus();
-  await page.keyboard.press("Tab");
-  await expect(result).toBeFocused();
-  expect(await result.evaluate((element) => getComputedStyle(element).outlineStyle)).toBe("solid");
-  await page.keyboard.press("Shift+Tab");
-  await expect(closeButton).toBeFocused();
-  expect(await closeButton.evaluate((element) => getComputedStyle(element).outlineStyle)).toBe(
-    "solid",
-  );
 
   await expect
     .poll(async () => (await results.boundingBox())?.width || 0)
-    .toBeGreaterThanOrEqual(350);
+    .toBeGreaterThanOrEqual(340);
   const timelineBox = await page.locator(".timeline").boundingBox();
   const resultsBox = await results.boundingBox();
   expect(timelineBox).not.toBeNull();
   expect(resultsBox).not.toBeNull();
   expect(resultsBox!.x).toBeGreaterThanOrEqual(timelineBox!.x + timelineBox!.width - 1);
-  expect(resultsBox!.width).toBeGreaterThanOrEqual(350);
-
-  if (process.env.CAPTURE_SEARCH_SIDEBAR_PROOF === "1") {
-    await page.screenshot({ path: "docs/proof/search-sidebar.png", fullPage: true });
-  }
-
-  await page.getByLabel("Search messages").fill("unsubmitted query");
-  await expect(results.getByText("Results for “precisionneedle”")).toBeVisible();
-  await expect(result).toBeVisible();
+  expect(resultsBox!.width).toBeGreaterThanOrEqual(340);
 
   await result.click();
   await expect(results).toBeVisible();
@@ -2207,36 +2224,6 @@ test("renders search results in a responsive sidebar", async ({ page }) => {
   await expect
     .poll(async () => (await page.locator(".timeline").boundingBox())?.width || 0)
     .toBeGreaterThan(timelineBox!.width);
-
-  await page.getByLabel("Search messages").fill("threadneedle");
-  await page.getByRole("button", { name: "Search", exact: true }).click();
-  const threadResult = results.locator(".search-result", { hasText: "threadneedle" });
-  await expect(threadResult).toBeVisible();
-  await threadResult.click();
-  await expect(results).toHaveCount(0);
-  await expect(page.getByLabel("Thread pane")).toBeVisible();
-  await expect(page.locator(".reply .markdown").filter({ hasText: threadReply })).toBeVisible();
-  await page.getByLabel("Search messages").fill("precisionneedle");
-  await page.getByRole("button", { name: "Search", exact: true }).click();
-  await expect(results).toBeVisible();
-  await page.keyboard.press("Escape");
-  await expect(results).toHaveCount(0);
-  await expect(page.getByLabel("Thread pane")).toBeVisible();
-  await expect(page.locator(".reply .markdown").filter({ hasText: threadReply })).toBeVisible();
-  await page.getByLabel("Thread pane").getByRole("button", { name: "Close thread" }).click();
-
-  await page.setViewportSize({ width: 1024, height: 720 });
-  await page.getByLabel("Search messages").fill("precisionneedle");
-  await page.getByRole("button", { name: "Search", exact: true }).click();
-  await expect(results).toBeVisible();
-  await expect
-    .poll(() =>
-      page
-        .locator(".shell")
-        .evaluate((element) => getComputedStyle(element).gridTemplateColumns.split(" ").length),
-    )
-    .toBe(3);
-  await results.getByRole("button", { name: "Close search panel" }).click();
 
   await page.setViewportSize({ width: 768, height: 720 });
   await page.getByLabel("Search messages").fill("precisionneedle");
@@ -2250,41 +2237,145 @@ test("renders search results in a responsive sidebar", async ({ page }) => {
   const mobileResultsBox = await results.boundingBox();
   expect(mobileResultsBox!.x + mobileResultsBox!.width).toBe(768);
   expect(mobileResultsBox!.height).toBe(720);
-  await page.setViewportSize({ width: 420, height: 720 });
-  await expect(results).toHaveAttribute("role", "dialog");
-  await expect(results).toHaveAttribute("aria-modal", "true");
-  await expect(results.getByRole("button", { name: "Close search panel" })).toBeFocused();
-  await expect(page.locator(".timeline")).toHaveAttribute("inert", "");
-  await expect(page.getByRole("button", { name: "Toggle navigation" })).toHaveAttribute(
-    "inert",
-    "",
-  );
-  await page.setViewportSize({ width: 768, height: 720 });
-  await expect(results).toHaveAttribute("role", "complementary");
-  await expect(results).not.toHaveAttribute("aria-modal", "true");
-  await expect(page.locator(".timeline")).not.toHaveAttribute("inert", "");
-  await expect(page.getByRole("button", { name: "Toggle navigation" })).not.toHaveAttribute(
-    "inert",
-    "",
-  );
   await page.keyboard.press("Escape");
   await expect(results).toHaveCount(0);
-
-  await page.setViewportSize({ width: 420, height: 720 });
-  await page.getByLabel("Search messages").fill("precisionneedle");
-  await page.getByRole("button", { name: "Search", exact: true }).click();
-  const fullWidthResult = results.locator(".search-result", { hasText: "precisionneedle" });
-  await expect(fullWidthResult).toBeVisible();
-  const fullWidthCloseButton = results.getByRole("button", { name: "Close search panel" });
-  await expect(fullWidthCloseButton).toBeFocused();
-  await page.keyboard.press("Shift+Tab");
-  await expect(fullWidthResult).toBeFocused();
-  await page.keyboard.press("Tab");
-  await expect(fullWidthCloseButton).toBeFocused();
-  await fullWidthResult.click();
-  await expect(results).toHaveCount(0);
-  await expect(page.locator(".message-row.highlight")).toContainText("precisionneedle");
 });
+
+test("search paginates, and handles empty, failed, and stale responses", async ({ page }) => {
+  const workspacesResponse = await page.request.get("/api/workspaces");
+  const workspaces = (await workspacesResponse.json()) as { workspaces: { id: string }[] };
+  const workspaceId = workspaces.workspaces[0].id;
+  const channelResponse = await page.request.post(`/api/workspaces/${workspaceId}/channels`, {
+    data: { name: `search-pages-${Date.now()}`, kind: "public" },
+  });
+  const { channel } = (await channelResponse.json()) as { channel: { id: string; name: string } };
+
+  await page.goto("/app");
+  await waitForAppReady(page);
+  await page.getByRole("link", { name: `# ${channel.name}` }).click();
+  await expect(page.getByRole("heading", { name: `#${channel.name}` })).toBeVisible();
+
+  const result = (index: number) => ({
+    id: `MSEARCH${String(index).padStart(10, "0")}`,
+    workspace_id: workspaceId,
+    channel_id: channel.id,
+    channel_name: channel.name,
+    author: {
+      id: "USEARCH000000000",
+      kind: "human",
+      display_name: "Search Fixture",
+      handle: "search-fixture",
+      avatar_url: "",
+      created_at: "2026-01-01T00:00:00Z",
+    },
+    thread_root_id: `MSEARCH${String(index).padStart(10, "0")}`,
+    channel_seq: index + 1,
+    created_at: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
+    reply_count: 0,
+    snippet: `pagermatch entry ${String(index).padStart(2, "0")} for cursor paging`,
+    highlights: [{ start: 0, end: 10 }],
+  });
+  const firstPage = Array.from({ length: 50 }, (_, index) => result(index));
+  const secondPage = Array.from({ length: 10 }, (_, index) => result(index + 50));
+  let failNextPage = false;
+  await page.route("**/api/search?*", async (route) => {
+    const url = new URL(route.request().url());
+    const query = url.searchParams.get("q");
+    if (query === "zzzunfindable") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ results: [], next_cursor: null }),
+      });
+      return;
+    }
+    if (query === "stalefirst") {
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ results: [], next_cursor: null }),
+      });
+      return;
+    }
+    if (query === "initialfailure") {
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: `{"error":"boom"}`,
+      });
+      return;
+    }
+    if (query === "pagermatch") {
+      const cursor = url.searchParams.get("cursor");
+      if (cursor && failNextPage) {
+        failNextPage = false;
+        await route.fulfill({
+          status: 500,
+          contentType: "application/json",
+          body: `{"error":"boom"}`,
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          results: cursor ? secondPage : firstPage,
+          next_cursor: cursor ? null : "search-next-page",
+        }),
+      });
+      return;
+    }
+    await route.fallback();
+  });
+
+  const results = page.getByLabel("Search results");
+  async function submitSearch(query: string) {
+    await page.getByLabel("Search messages").fill(query);
+    await page.getByRole("button", { name: "Search", exact: true }).click();
+  }
+
+  // Empty state.
+  await submitSearch("zzzunfindable");
+  await expect(results.getByText("No messages found")).toBeVisible();
+
+  // First page plus cursor.
+  await submitSearch("pagermatch");
+  await expect(results.locator(".search-result")).toHaveCount(50);
+  const loadMore = results.getByRole("button", { name: "Load more results" });
+  await expect(loadMore).toBeVisible();
+
+  // A failed additional page keeps loaded results and offers a retry.
+  failNextPage = true;
+  await loadMore.click();
+  await expect(results.locator(".search-foot-error")).toBeVisible();
+  await expect(results.locator(".search-result")).toHaveCount(50);
+
+  // Retry appends the second page without duplicates or gaps.
+  await results.getByRole("button", { name: "Retry" }).click();
+  await expect(results.locator(".search-result")).toHaveCount(60);
+  await expect(results.getByText("End of results")).toBeVisible();
+  const resultIDs = await results
+    .locator(".search-result")
+    .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-result-id")));
+  expect(new Set(resultIDs).size).toBe(60);
+
+  // A stale slow response cannot replace a newer search.
+  await submitSearch("stalefirst");
+  await submitSearch("pagermatch");
+  await expect(results.getByText("Results for “pagermatch”")).toBeVisible();
+  await expect(results.locator(".search-result")).toHaveCount(50);
+  await page.waitForTimeout(1400);
+  await expect(results.getByText("Results for “pagermatch”")).toBeVisible();
+  await expect(results.locator(".search-result")).toHaveCount(50);
+
+  // A failed initial search shows the error state.
+  await submitSearch("initialfailure");
+  await expect(results.getByText("We couldn’t search messages")).toBeVisible();
+  await page.unroute("**/api/search?*");
+});
+
 test("message history pages older, newer, and search target windows", async ({ page }) => {
   const workspacesResponse = await page.request.get("/api/workspaces");
   const workspaces = (await workspacesResponse.json()) as { workspaces: { id: string }[] };

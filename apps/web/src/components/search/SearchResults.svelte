@@ -1,77 +1,22 @@
 <script lang="ts">
-  import { onMount } from "svelte";
   import Avatar from "../avatar/Avatar.svelte";
   import { handleLabel, isDeletedBot, userHandle } from "../../lib/chat/people";
-  import { time } from "../../lib/format";
-  import type { SearchHighlight, SearchResult } from "../../lib/types";
+  import type { SearchHighlight, SearchResult, SearchSession } from "../../lib/types";
 
   type Props = {
-    query: string;
-    results: SearchResult[];
-    state: "idle" | "loading" | "ready" | "error";
-    error: string;
+    session: SearchSession;
     covered?: boolean;
     inert?: boolean;
+    contextFor: (result: SearchResult) => string;
     onClose: () => void;
     onOpenResult: (result: SearchResult) => void;
-    onPanelRef?: (element: HTMLElement | null) => void;
+    onLoadMore: () => void;
   };
 
-  let {
-    query,
-    results,
-    state: searchState,
-    error,
-    covered = false,
-    inert = false,
-    onClose,
-    onOpenResult,
-    onPanelRef,
-  }: Props = $props();
-  let panelElement = $state<HTMLElement>();
-  let closeButton = $state<HTMLButtonElement>();
-  let fullWidth = $state(false);
-
-  onMount(() => {
-    onPanelRef?.(panelElement ?? null);
-    const media = window.matchMedia("(max-width: 420px)");
-    let restoreFocus: HTMLElement | null = null;
-    const syncFullWidth = () => {
-      const nextFullWidth = media.matches;
-      if (nextFullWidth === fullWidth) return;
-      fullWidth = nextFullWidth;
-      if (nextFullWidth) {
-        restoreFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-        closeButton?.focus();
-      } else {
-        restoreFocus?.focus();
-        restoreFocus = null;
-      }
-    };
-    syncFullWidth();
-    media.addEventListener("change", syncFullWidth);
-    return () => {
-      media.removeEventListener("change", syncFullWidth);
-      if (fullWidth) restoreFocus?.focus();
-      onPanelRef?.(null);
-    };
-  });
-
-  function handlePanelKeydown(event: KeyboardEvent) {
-    if (!fullWidth || event.key !== "Tab") return;
-    if (!panelElement) return;
-    const focusable = Array.from(panelElement.querySelectorAll<HTMLElement>("button:not(:disabled)"));
-    if (focusable.length === 0) return;
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    if (event.shiftKey && document.activeElement === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && document.activeElement === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  }
+  let { session, covered = false, inert = false, contextFor, onClose, onOpenResult, onLoadMore }: Props = $props();
+  const timeFormatter = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
+  const dayFormatter = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
+  const yearFormatter = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" });
 
   function snippetParts(snippet: string, highlights: SearchHighlight[]) {
     const characters = Array.from(snippet);
@@ -87,83 +32,141 @@
     if (position < characters.length) parts.push({ text: characters.slice(position).join(""), highlighted: false });
     return parts;
   }
+
+  function resultTimestamp(value: string): string {
+    const date = new Date(value);
+    const now = new Date();
+    if (date.toDateString() === now.toDateString()) {
+      return timeFormatter.format(date);
+    }
+    if (date.getFullYear() === now.getFullYear()) {
+      return dayFormatter.format(date);
+    }
+    return yearFormatter.format(date);
+  }
 </script>
 
 <aside
-  bind:this={panelElement}
   class="search-results"
   class:covered
   {inert}
   aria-hidden={covered ? "true" : undefined}
   aria-label="Search results"
-  role={fullWidth ? "dialog" : "complementary"}
-  aria-modal={fullWidth ? "true" : undefined}
-  onkeydown={handlePanelKeydown}
 >
   <header class="search-results-head">
     <div>
-      <p>Search</p>
-      <strong>Results for “{query}”</strong>
+      <p>Search{session.scope.label ? ` in ${session.scope.label}` : ""}</p>
+      <strong>Results for “{session.query}”</strong>
     </div>
-    <button bind:this={closeButton} type="button" aria-label="Close search panel" onclick={onClose}>&times;</button>
+    <button type="button" class="close" aria-label="Close search panel" onclick={onClose}>&times;</button>
   </header>
 
   <div class="search-results-summary" aria-live="polite">
-    {#if searchState === "loading"}
+    {#if session.state === "loading"}
       Searching messages…
-    {:else if searchState === "ready"}
-      {results.length} {results.length === 1 ? "result" : "results"}
-    {:else if searchState === "error"}
+    {:else if session.state === "ready"}
+      {session.results.length}{session.nextCursor ? "+" : ""}{" "}
+      {session.results.length === 1 && !session.nextCursor ? "result" : "results"}{#if session.scope.label}
+        in {session.scope.label}
+      {/if}
+    {:else if session.state === "error"}
       Search unavailable
     {/if}
   </div>
 
   <div class="search-results-scroll">
-    {#if searchState === "loading"}
-      <div class="search-state search-state-loading" role="status">
+    {#if session.state === "loading"}
+      <div class="search-state search-state-loading" role="status" aria-label="Searching">
         <span></span><span></span><span></span>
       </div>
-    {:else if searchState === "error"}
+    {:else if session.state === "error"}
       <div class="search-state">
         <span class="search-state-icon" aria-hidden="true">!</span>
         <strong>We couldn’t search messages</strong>
-        <p>{error}</p>
+        <p>{session.error}</p>
       </div>
-    {:else if results.length === 0}
+    {:else if session.results.length === 0}
       <div class="search-state">
         <span class="search-state-icon" aria-hidden="true">⌕</span>
         <strong>No messages found</strong>
         <p>Try another word or phrase.</p>
       </div>
     {:else}
-      {#each results as result (result.id)}
-        <button class="search-result" onclick={() => onOpenResult(result)}>
-          <Avatar
-            class="dm-avatar"
-            id={result.author.id}
-            name={result.author.display_name}
-            src={isDeletedBot(result.author) ? undefined : result.author.avatar_url}
-            size={30}
-          />
-          <div class="search-result-body">
-            <div>
-              <strong>{result.author.display_name || "Local User"}</strong>
-              {#if isDeletedBot(result.author)}
-                <span class="bot-chip bot-chip--deleted">deleted bot</span>
-              {/if}
-              {#if userHandle(result.author)}
-                <span>{handleLabel(userHandle(result.author))}</span>
-              {/if}
-              <time>{time(result.created_at)}</time>
-            </div>
-            <span class="search-result-snippet">
-              {#each snippetParts(result.snippet, result.highlights) as part}
-                {#if part.highlighted}<mark>{part.text}</mark>{:else}{part.text}{/if}
-              {/each}
-            </span>
-          </div>
+      <ul class="search-result-list">
+        {#each session.results as result (result.id)}
+          {@const context = contextFor(result)}
+          <li>
+            <button
+              type="button"
+              class="search-result"
+              class:is-active={session.activeResultID === result.id}
+              data-result-id={result.id}
+              onclick={() => onOpenResult(result)}
+            >
+              <Avatar
+                class="dm-avatar"
+                id={result.author.id}
+                name={result.author.display_name}
+                src={isDeletedBot(result.author) ? undefined : result.author.avatar_url}
+                size={30}
+              />
+              <div class="search-result-body">
+                <div class="search-result-meta">
+                  <strong>{result.author.display_name || "Local User"}</strong>
+                  {#if isDeletedBot(result.author)}
+                    <span class="bot-chip bot-chip--deleted">deleted bot</span>
+                  {:else if userHandle(result.author)}
+                    <span class="search-result-handle">{handleLabel(userHandle(result.author))}</span>
+                  {/if}
+                  <time datetime={result.created_at}>{resultTimestamp(result.created_at)}</time>
+                </div>
+                <span class="search-result-snippet">
+                  {#each snippetParts(result.snippet, result.highlights) as part}
+                    {#if part.highlighted}<mark>{part.text}</mark>{:else}{part.text}{/if}
+                  {/each}
+                </span>
+                <div class="search-result-context">
+                  {#if context}
+                    <span class="search-result-where">{context}</span>
+                  {/if}
+                  {#if result.parent_message_id}
+                    <span class="search-result-thread">
+                      <svg viewBox="0 0 24 24" width="12" height="12" aria-hidden="true">
+                        <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M21 12a8 8 0 0 1-8 8H7l-4 3V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8z"/>
+                      </svg>
+                      Reply in thread
+                    </span>
+                  {:else if result.reply_count > 0}
+                    <span class="search-result-thread">
+                      <svg viewBox="0 0 24 24" width="12" height="12" aria-hidden="true">
+                        <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M21 12a8 8 0 0 1-8 8H7l-4 3V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8z"/>
+                      </svg>
+                      {result.reply_count} {result.reply_count === 1 ? "reply" : "replies"}
+                    </span>
+                  {/if}
+                </div>
+              </div>
+            </button>
+          </li>
+        {/each}
+      </ul>
+      {#if session.moreError}
+        <div class="search-foot-error" role="alert">
+          <p>{session.moreError}</p>
+          <button type="button" onclick={onLoadMore}>Retry</button>
+        </div>
+      {:else if session.nextCursor}
+        <button
+          type="button"
+          class="search-load-more"
+          disabled={session.loadingMore}
+          onclick={onLoadMore}
+        >
+          {session.loadingMore ? "Loading more…" : "Load more results"}
         </button>
-      {/each}
+      {:else}
+        <div class="search-end" aria-hidden="true">End of results</div>
+      {/if}
     {/if}
   </div>
 </aside>

@@ -44,14 +44,13 @@
   import DesktopTitlebar from "./components/topbar/DesktopTitlebar.svelte";
   import Topbar from "./components/topbar/Topbar.svelte";
   import { workspaceSettingsPath, type AccountSettingsSectionId } from "./lib/settings";
-  import type { Channel, DirectConversation, MemberModeration, Message, MessagePage, RealtimeEvent, RouteTarget, SearchResult, SlashCommand, ThreadState, Upload, User, Workspace, WorkspaceBotCommand } from "./lib/types";
+  import type { Channel, DirectConversation, MemberModeration, Message, MessagePage, RealtimeEvent, RouteTarget, SearchResult, SearchScope, SearchSession, SlashCommand, ThreadState, Upload, User, Workspace, WorkspaceBotCommand } from "./lib/types";
   import { dispatchSlashCommand, findRegisteredCommand, listBotCommands, splitSlashDraft } from "./lib/commands";
 
   const LIVE_EDGE_TOLERANCE_PX = 96;
   const LAST_CHANNEL_STORAGE_PREFIX = "clickclack:last-channel:v1:";
   const BROWSER_NOTIFICATIONS_STORAGE_PREFIX = "clickclack:browser-notifications-enabled:v1:";
   const MOBILE_NAV_MEDIA_QUERY = "(max-width: 820px)";
-  const FULL_WIDTH_SEARCH_MEDIA_QUERY = "(max-width: 420px)";
   const SHOW_AGENT_ACTIVITY_STORAGE_KEY = "clickclack:show-agent-activity:v1";
   const HIDE_COMMENTARY_STORAGE_KEY = "clickclack:hide-commentary:v1";
   const HIDE_TOOL_CALLS_STORAGE_KEY = "clickclack:hide-tool-calls:v1";
@@ -89,22 +88,21 @@
   let artifactTrigger: HTMLElement | null = null;
   let artifactThreadScrollTop: number | null = null;
   let artifactViewerElement: HTMLElement | null = null;
-  let searchResultsElement: HTMLElement | null = null;
   let shellElement: HTMLElement | null = null;
-  let modalInertElements = new Set<HTMLElement>();
+  let artifactModalInertElements = new Set<HTMLElement>();
   let messageBody = "";
   let replyBody = "";
   let workspaceName = "";
   let channelName = "";
   let directMemberID = "";
   let searchQuery = "";
-  let submittedSearchQuery = "";
-  let searchResults: SearchResult[] = [];
-  let searchPanelOpen = false;
-  let searchState: "idle" | "loading" | "ready" | "error" = "idle";
-  let searchError = "";
+  // A search session owns the right pane until it is closed or replaced.
+  // Opening a thread from a result "detours" the pane to that thread while the
+  // session (results, cursor, scroll, active row) survives for Back.
+  let searchSession: SearchSession | null = null;
+  let searchThreadDetour = false;
+  let searchReturnScrollTop = 0;
   let searchRequestID = 0;
-  let searchResultOpening = false;
   let pendingUpload: Upload | null = null;
   let showGifPicker = false;
   let settingsModalOpen = false;
@@ -153,7 +151,6 @@
   let sidebarCollapsed = false;
   let mobileNavOpen = false;
   let mobileNavViewport = false;
-  let searchModalViewport = false;
   let replyTarget: Message | null = null;
   let replyContext: "channel" | "dm" | "thread" | null = null;
   let messageInput: HTMLTextAreaElement | null = null;
@@ -253,17 +250,16 @@
     turn.lines.some((line) => !line.finalized),
   );
   $: sidePanelOpen = selectedThread !== null || selectedProfile !== null || selectedArtifact !== null;
+  // The shared right-pane slot renders search or thread, never both.
+  $: searchPaneVisible = searchSession !== null && !searchThreadDetour;
   $: if (selectedArtifact && artifactConversationKey && artifactConversationKey !== activeConversationKey) {
     selectedArtifact = null;
     artifactConversationKey = "";
     artifactTrigger = null;
   }
-  $: syncShellModalInert(
-    mobileNavViewport && selectedArtifact !== null
-      ? artifactViewerElement
-      : searchPanelOpen && searchModalViewport
-        ? searchResultsElement
-        : null,
+  $: syncArtifactModalInert(
+    mobileNavViewport && selectedArtifact !== null,
+    artifactViewerElement,
   );
   $: recentPeople = collectRecentPeople(messages, directConversations, user?.id || "");
   $: mentionPeople = collectMentionPeople(user, recentPeople, moderationMembers, selectedDirect);
@@ -289,25 +285,18 @@
     syncBrowserNotificationState();
     void boot();
     const mobileNavMedia = window.matchMedia(MOBILE_NAV_MEDIA_QUERY);
-    const searchModalMedia = window.matchMedia(FULL_WIDTH_SEARCH_MEDIA_QUERY);
     const handleMobileNavBreakpoint = () => {
       mobileNavOpen = false;
       mobileNavViewport = mobileNavMedia.matches;
     };
-    const handleSearchModalBreakpoint = () => {
-      searchModalViewport = searchModalMedia.matches;
-    };
     handleMobileNavBreakpoint();
-    handleSearchModalBreakpoint();
     const stopDesktopNavigate = desktop?.onNavigate((route) => {
       void goto(route, { keepFocus: true, noScroll: true });
     });
     const stopDesktopQuickCompose = desktop?.onQuickCompose(() => focusActiveComposer());
     mobileNavMedia.addEventListener("change", handleMobileNavBreakpoint);
-    searchModalMedia.addEventListener("change", handleSearchModalBreakpoint);
     return () => {
       mobileNavMedia.removeEventListener("change", handleMobileNavBreakpoint);
-      searchModalMedia.removeEventListener("change", handleSearchModalBreakpoint);
       stopDesktopNavigate?.();
       stopDesktopQuickCompose?.();
     };
@@ -407,7 +396,7 @@
     if (agentProgressSweeper) window.clearInterval(agentProgressSweeper);
     if (activityClockSweeper) window.clearInterval(activityClockSweeper);
     if (hiddenDirectUndoTimer) clearTimeout(hiddenDirectUndoTimer);
-    syncShellModalInert(null);
+    syncArtifactModalInert(false, null);
   });
 
   async function boot() {
@@ -547,6 +536,9 @@
   }
 
   function clearRoutePanelState() {
+    // Navigating away abandons a thread borrowed from search; drop the session
+    // too so the pane doesn't linger invisibly.
+    if (searchThreadDetour) resetSearch();
     selectedThread = null;
     selectedThreadState = null;
     selectedProfile = null;
@@ -847,6 +839,7 @@
       selectedChannelID = "";
     }
     if (resetSidePanel) {
+      if (searchThreadDetour) resetSearch();
       selectedThread = null;
       selectedProfile = null;
       activeComposerContext = "message";
@@ -2073,18 +2066,27 @@
     }
   }
 
-  async function refreshThread(messageID: string, optimisticRoot?: Message) {
+  async function refreshThread(
+    messageID: string,
+    optimisticRoot?: Message,
+    shouldCommit: () => boolean = () => true,
+  ): Promise<boolean> {
     selectedArtifact = null;
     artifactConversationKey = "";
     selectedProfile = null;
-    if (optimisticRoot) selectedThread = optimisticRoot;
-    activeComposerContext = "thread";
+    if (optimisticRoot) {
+      selectedThread = optimisticRoot;
+      activeComposerContext = "thread";
+    }
     const data = await api<{ root: Message; replies: Message[]; thread_state: ThreadState }>(`/api/messages/${messageID}/thread`);
+    if (!shouldCommit()) return false;
     const root = { ...data.root, thread_state: data.thread_state };
     selectedThread = root;
+    activeComposerContext = "thread";
     setActiveMessages(messages.map((message) => message.id === root.id ? root : message));
     replies = data.replies;
     selectedThreadState = data.thread_state;
+    return true;
   }
 
   async function refreshThreadSummary(messageID: string) {
@@ -2194,67 +2196,180 @@
       return;
     }
     const query = searchQuery.trim();
+    // Search takes over the shared right pane: retire whatever occupies it.
+    if (selectedArtifact) closeArtifactViewer();
+    if (selectedThread || selectedProfile) closeSidePanel();
     const requestID = ++searchRequestID;
-    submittedSearchQuery = query;
-    searchPanelOpen = true;
-    searchState = "loading";
-    searchError = "";
-    const params = new URLSearchParams({ workspace_id: selectedWorkspaceID, q: query });
-    if (selectedDirectID) params.set("direct_conversation_id", selectedDirectID);
-    else if (selectedChannelID) params.set("channel_id", selectedChannelID);
+    const scope: SearchScope =
+      selectedDirectID && selectedDirect
+        ? {
+            workspaceID: selectedWorkspaceID,
+            channelID: "",
+            directConversationID: selectedDirectID,
+            label: `@${dmTitle(selectedDirect, user?.id)}`,
+          }
+        : selectedChannelID && selectedChannel
+          ? {
+              workspaceID: selectedWorkspaceID,
+              channelID: selectedChannelID,
+              directConversationID: "",
+              label: `#${selectedChannel.name}`,
+            }
+          : { workspaceID: selectedWorkspaceID, channelID: "", directConversationID: "", label: "" };
+    searchThreadDetour = false;
+    searchReturnScrollTop = 0;
+    const session: SearchSession = {
+      query,
+      scope,
+      results: [],
+      nextCursor: null,
+      state: "loading",
+      error: "",
+      loadingMore: false,
+      moreError: "",
+      activeResultID: "",
+    };
+    searchSession = session;
     try {
       const data = await api<{ results: SearchResult[]; next_cursor: string | null }>(
-        `/api/search?${params.toString()}`,
+        `/api/search?${searchPageParams(session).toString()}`,
       );
       if (requestID !== searchRequestID) return;
-      searchResults = data.results;
-      searchState = "ready";
+      searchSession = { ...session, results: data.results, nextCursor: data.next_cursor, state: "ready" };
     } catch (error) {
       if (requestID !== searchRequestID) return;
-      searchResults = [];
-      searchState = "error";
-      searchError = error instanceof APIError ? error.message : "Search is unavailable right now.";
+      searchSession = {
+        ...session,
+        state: "error",
+        error: error instanceof APIError ? error.message : "Search is unavailable right now.",
+      };
+    }
+  }
+
+  function searchPageParams(session: SearchSession, cursor = ""): URLSearchParams {
+    const params = new URLSearchParams({ workspace_id: session.scope.workspaceID, q: session.query });
+    if (session.scope.directConversationID) params.set("direct_conversation_id", session.scope.directConversationID);
+    else if (session.scope.channelID) params.set("channel_id", session.scope.channelID);
+    if (cursor) params.set("cursor", cursor);
+    return params;
+  }
+
+  async function loadMoreSearchResults() {
+    const session = searchSession;
+    if (!session || session.state !== "ready" || !session.nextCursor || session.loadingMore) return;
+    const requestID = searchRequestID;
+    searchSession = { ...session, loadingMore: true, moreError: "" };
+    try {
+      const data = await api<{ results: SearchResult[]; next_cursor: string | null }>(
+        `/api/search?${searchPageParams(session, session.nextCursor).toString()}`,
+      );
+      if (requestID !== searchRequestID || !searchSession) return;
+      const seen = new Set(searchSession.results.map((result) => result.id));
+      searchSession = {
+        ...searchSession,
+        results: [...searchSession.results, ...data.results.filter((result) => !seen.has(result.id))],
+        nextCursor: data.next_cursor,
+        loadingMore: false,
+      };
+    } catch (error) {
+      if (requestID !== searchRequestID || !searchSession) return;
+      searchSession = {
+        ...searchSession,
+        loadingMore: false,
+        moreError: error instanceof APIError ? error.message : "Couldn’t load more results.",
+      };
     }
   }
 
   function resetSearch() {
     searchRequestID += 1;
     searchQuery = "";
-    submittedSearchQuery = "";
-    searchResults = [];
-    searchPanelOpen = false;
-    searchState = "idle";
-    searchError = "";
+    searchSession = null;
+    searchThreadDetour = false;
+    searchReturnScrollTop = 0;
+  }
+
+  function searchResultContext(result: SearchResult): string {
+    if (result.channel_name) return `#${result.channel_name}`;
+    if (result.direct_conversation_id) {
+      const conversation = directConversations.find((item) => item.id === result.direct_conversation_id);
+      return conversation ? `@${dmTitle(conversation, user?.id)}` : "Direct message";
+    }
+    return "";
   }
 
   async function openSearchResult(result: SearchResult) {
+    const session = searchSession;
     const targetID = result.channel_id || result.direct_conversation_id || "";
-    if (!selectedWorkspaceID || !targetID || searchResultOpening) return;
-    searchResultOpening = true;
-    try {
-      if (window.matchMedia(FULL_WIDTH_SEARCH_MEDIA_QUERY).matches) resetSearch();
-      if (currentConversationKey() !== targetID) {
-        await navigateToApp(selectedWorkspaceID, targetID);
-        await applyRoute(selectedWorkspaceID, targetID);
-      }
-      if (currentConversationKey() !== targetID) return;
-      if (result.parent_message_id) {
-        resetSearch();
-        await refreshThread(result.thread_root_id);
-        if (selectedThread?.route_id) {
-          await navigateToApp(selectedWorkspaceID, selectedThread.id);
-        }
-        await highlightMessage(result.id);
-        return;
-      }
-      if (result.channel_seq && result.channel_seq > 0) {
-        await loadMessagesAroundSeq(result.channel_seq, result.id);
-        return;
-      }
-      await loadMessages();
-    } finally {
-      searchResultOpening = false;
+    if (!session || !selectedWorkspaceID || !targetID) return;
+    searchSession = { ...session, activeResultID: result.id };
+    if (currentConversationKey() !== targetID) {
+      await navigateToApp(selectedWorkspaceID, targetID);
+      await applyRoute(selectedWorkspaceID, targetID);
     }
+    if (currentConversationKey() !== targetID) return;
+    if (result.parent_message_id) {
+      // Thread reply: the thread borrows the pane; the session stays for Back.
+      const returnScrollTop =
+        document.querySelector<HTMLElement>(".search-results-scroll")?.scrollTop ?? 0;
+      searchReturnScrollTop = returnScrollTop;
+      const requestID = searchRequestID;
+      searchThreadDetour = true;
+      try {
+        const loaded = await refreshThread(
+          result.thread_root_id,
+          undefined,
+          () =>
+            requestID === searchRequestID &&
+            searchThreadDetour &&
+            searchSession?.activeResultID === result.id,
+        );
+        if (!loaded) return;
+      } catch (error) {
+        searchThreadDetour = false;
+        await tick();
+        throw error;
+      }
+      if (selectedThread?.route_id) {
+        await navigateToApp(selectedWorkspaceID, selectedThread.id);
+      }
+      await tick();
+      const reply = document.querySelector<HTMLElement>(
+        `.thread [data-message-id="${CSS.escape(result.id)}"]`,
+      );
+      reply?.scrollIntoView({ block: "center" });
+      document.querySelector<HTMLElement>(".thread .thread-back")?.focus();
+      await highlightMessage(result.id);
+      return;
+    }
+    if (result.channel_seq && result.channel_seq > 0) {
+      await loadMessagesAroundSeq(result.channel_seq, result.id);
+      return;
+    }
+    await loadMessages();
+  }
+
+  async function returnToSearchFromThread() {
+    if (!searchSession || !searchThreadDetour) return;
+    const parentTargetID = currentConversationKey();
+    if (replyContext === "thread") clearReplyTarget();
+    selectedThread = null;
+    selectedProfile = null;
+    activeComposerContext = "message";
+    replies = [];
+    searchThreadDetour = false;
+    if (selectedWorkspaceID && parentTargetID) {
+      await navigateToApp(selectedWorkspaceID, parentTargetID);
+    }
+    await tick();
+    const scroll = document.querySelector<HTMLElement>(".search-results-scroll");
+    if (scroll) scroll.scrollTop = searchReturnScrollTop;
+    const active = searchSession.activeResultID
+      ? document.querySelector<HTMLElement>(
+          `.search-result[data-result-id="${CSS.escape(searchSession.activeResultID)}"]`,
+        )
+      : null;
+    active?.focus({ preventScroll: true });
   }
 
   async function loadMessagesAround(target: Message) {
@@ -2465,7 +2580,6 @@
     if (!workspaceID || workspaceID !== selectedWorkspaceID) return;
     const selectedThreadID = selectedThread?.id || "";
     const selectedBotProfileID = selectedProfile?.kind === "bot" ? selectedProfile.id : "";
-    searchResults = [];
     typingEntries = [];
     agentProgressTurns = [];
     await Promise.all([
@@ -2618,7 +2732,15 @@
     slashCommands = slashCommands.filter((command) => command.bot_user_id !== botUserID);
     botCommands = botCommands.filter((command) => command.bot.id !== botUserID);
     typingEntries = typingEntries.filter((entry) => entry.userID !== botUserID);
-    searchResults = [];
+    if (searchSession) {
+      searchSession = {
+        ...searchSession,
+        results: searchSession.results.map((result) => ({
+          ...result,
+          author: deletedMember(result.author),
+        })),
+      };
+    }
     if (selectedProfile?.id === botUserID) selectedProfile = null;
 
     const selectedThreadID = selectedThread?.id || "";
@@ -2935,14 +3057,14 @@
     });
   }
 
-  function syncShellModalInert(viewer: HTMLElement | null) {
-    for (const element of modalInertElements) element.inert = false;
-    modalInertElements.clear();
-    if (!shellElement || !viewer) return;
+  function syncArtifactModalInert(active: boolean, viewer: HTMLElement | null) {
+    for (const element of artifactModalInertElements) element.inert = false;
+    artifactModalInertElements.clear();
+    if (!active || !shellElement || !viewer) return;
     for (const child of shellElement.children) {
       if (!(child instanceof HTMLElement) || child === viewer || child.inert) continue;
       child.inert = true;
-      modalInertElements.add(child);
+      artifactModalInertElements.add(child);
     }
   }
 
@@ -2999,13 +3121,16 @@
       return;
     }
     const threadWasOpen = selectedThread !== null;
+    const searchDetourWasOpen = searchThreadDetour;
     const parentTargetID = currentConversationKey();
     if (replyContext === "thread") clearReplyTarget();
     selectedThread = null;
     selectedProfile = null;
     activeComposerContext = "message";
     replies = [];
-    if (threadWasOpen && selectedWorkspaceID && parentTargetID) {
+    // Closing a thread opened from search closes the whole pane, session included.
+    if (searchDetourWasOpen) resetSearch();
+    if ((threadWasOpen || searchDetourWasOpen) && selectedWorkspaceID && parentTargetID) {
       void navigateToApp(selectedWorkspaceID, parentTargetID);
     }
   }
@@ -3035,7 +3160,11 @@
         event.preventDefault();
         closeSidePanel();
         return;
-      } else if (searchPanelOpen) {
+      } else if (searchThreadDetour) {
+        event.preventDefault();
+        closeSidePanel();
+        return;
+      } else if (searchPaneVisible) {
         event.preventDefault();
         resetSearch();
         return;
@@ -3140,8 +3269,8 @@
   class:desktop-shell={integratedTitleBar}
   class:nav-open={mobileNavOpen}
   class:sidebar-collapsed={sidebarCollapsed}
-  class:thread-open={sidePanelOpen && !searchPanelOpen}
-  class:search-open={searchPanelOpen}
+  class:thread-open={sidePanelOpen && !searchPaneVisible}
+  class:search-open={searchPaneVisible}
   class:artifact-open={selectedArtifact !== null}
   data-connected={connected}
   data-app-ready={connected && status === "ready"}
@@ -3359,20 +3488,6 @@
     </div>
   </main>
 
-  {#if searchPanelOpen}
-    <SearchResults
-      query={submittedSearchQuery}
-      results={searchResults}
-      state={searchState}
-      error={searchError}
-      covered={selectedArtifact !== null}
-      inert={mobileNavOpen || selectedArtifact !== null}
-      onClose={resetSearch}
-      onOpenResult={(result) => void openSearchResult(result)}
-      onPanelRef={(element) => (searchResultsElement = element)}
-    />
-  {/if}
-
   {#if selectedArtifact}
     <aside
       bind:this={artifactViewerElement}
@@ -3386,12 +3501,23 @@
       <ArtifactViewer upload={selectedArtifact} onClose={closeArtifactViewer} />
     </aside>
   {/if}
+  {#if searchPaneVisible && searchSession}
+    <SearchResults
+      session={searchSession}
+      covered={selectedArtifact !== null}
+      inert={mobileNavOpen || selectedArtifact !== null}
+      contextFor={searchResultContext}
+      onClose={resetSearch}
+      onOpenResult={(result) => void openSearchResult(result)}
+      onLoadMore={() => void loadMoreSearchResults()}
+    />
+  {:else}
   <aside
     class="thread"
     class:open={sidePanelOpen}
-    class:covered={selectedArtifact !== null || searchPanelOpen}
-    inert={mobileNavOpen || selectedArtifact !== null || searchPanelOpen}
-    aria-hidden={selectedArtifact || searchPanelOpen ? "true" : undefined}
+    class:covered={selectedArtifact !== null}
+    inert={mobileNavOpen || selectedArtifact !== null}
+    aria-hidden={selectedArtifact ? "true" : undefined}
     aria-label={selectedProfile ? "Profile pane" : "Thread pane"}
   >
     {#if selectedThread}
@@ -3404,6 +3530,7 @@
         {mentionPeople}
         replyDisabled={Boolean(selectedDirect && !selectedDirectWritable)}
         onClose={closeSidePanel}
+        onBack={searchThreadDetour && searchSession ? () => void returnToSearchFromThread() : undefined}
         onReplyBody={(value) => (replyBody = value)}
         onSubmitReply={() => void sendReply()}
         onReplyKeydown={handleReplyKey}
@@ -3441,6 +3568,7 @@
       <ThreadEmptyState />
     {/if}
   </aside>
+  {/if}
 </div>
 {#if settingsModalOpen && user}
   <SettingsModal
